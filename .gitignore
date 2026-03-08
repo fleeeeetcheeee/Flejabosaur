@@ -27,3 +27,6 @@ Thumbs.db
 .env
 .env.local
 .env.*.local
+
+# Generated database
+*.db

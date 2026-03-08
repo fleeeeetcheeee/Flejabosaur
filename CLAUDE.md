@@ -53,7 +53,7 @@ User (IUPAC name)
 | `backend/chem/analyze.py` | RDKit: atom features, Gasteiger charges, ECFP4 fingerprint, functional group SMARTS |
 | `backend/chem/retrosynthesis.py` | 3-tier retro: AiZynthFinder MCTS → ReactionT5v2 beam search → SMARTS templates |
 | `backend/chem/reactiont5.py` | ReactionT5v2 integration: retrosynthesis, yield prediction, forward validation (HuggingFace) |
-| `backend/chem/scoring.py` | Composite score: Tanimoto (w=0.25) + mechanism (w=0.30) + yield (w=0.20) + forward (w=0.15) - hazard (w=0.10); Platt-scaled sigmoid |
+| `backend/chem/scoring.py` | Composite score: Tanimoto (w=0.25) + mechanism (w=0.25) + yield (w=0.25) + forward (w=0.15) - hazard (w=0.10); Platt-scaled sigmoid |
 | `backend/graph/dag.py` | Build per-molecule retro tree → NetworkX DiGraph (avoids Cartesian product) |
 | `backend/graph/cpm.py` | Critical Path Method: forward/backward pass over reaction DAG |
 | `backend/graph/pert.py` | PERT: μ = (a+4m+b)/6, σ²=((b-a)/6)², cumulative pathway probability |
@@ -72,7 +72,7 @@ User (IUPAC name)
 
 ### Scoring formula
 ```
-score(r) = 0.25·S_tanimoto + 0.30·S_mechanism + 0.20·S_yield + 0.15·S_forward − 0.10·S_hazard
+score(r) = 0.25·S_tanimoto + 0.25·S_mechanism + 0.25·S_yield + 0.15·S_forward − 0.10·S_hazard
 probability = sigmoid(Platt_scale(score))
 ```
 

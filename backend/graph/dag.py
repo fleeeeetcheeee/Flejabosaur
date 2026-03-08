@@ -142,6 +142,7 @@ def dag_to_dict(G: nx.DiGraph) -> dict:
             "target": dst,
             "label": attrs.get("reaction_name", ""),
             "data": {
+                "reaction_name": attrs.get("reaction_name", ""),
                 "conditions": attrs.get("conditions", {}),
                 "templateSmarts": attrs.get("template_smarts", ""),
                 "source": attrs.get("source", ""),

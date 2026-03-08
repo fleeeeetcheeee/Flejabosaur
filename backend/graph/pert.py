@@ -75,8 +75,8 @@ def run_pert(G: nx.DiGraph) -> PathwayPERT:
             # rather than arbitrary offsets
             default_a, default_m, default_b = DEFAULT_YIELDS.get(rname, DEFAULT_YIELD)
             default_mu = (default_a + 4 * default_m + default_b) / 6
-            default_spread_up = default_a - default_mu if default_m else 0.10
-            default_spread_down = default_mu - default_b if default_m else 0.15
+            default_spread_up = default_a - default_mu if default_m is not None else 0.10
+            default_spread_down = default_mu - default_b if default_m is not None else 0.15
             a = min(m + max(default_spread_up, 0.05), 0.99)
             b = max(m - max(default_spread_down, 0.05), 0.01)
 
