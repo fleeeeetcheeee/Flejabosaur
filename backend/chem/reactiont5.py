@@ -28,7 +28,7 @@ import os
 import re
 from functools import lru_cache
 
-from rdkit import Chem
+from rdkit import Chem  # type: ignore[import-not-found]
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +61,7 @@ def _load_model(task: str) -> tuple:
 
     model_id = MODEL_IDS[task]
     try:
-        from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+        from transformers import AutoTokenizer, AutoModelForSeq2SeqLM  # type: ignore[import-not-found]
         logger.info("Loading ReactionT5v2-%s from HuggingFace...", task)
         tokenizer = AutoTokenizer.from_pretrained(model_id)
         model = AutoModelForSeq2SeqLM.from_pretrained(model_id)
@@ -82,7 +82,7 @@ def _hf_inference_api(task: str, input_text: str) -> str | None:
     Fallback: call HuggingFace Inference API.
     Requires HF_TOKEN environment variable.
     """
-    import httpx
+    import httpx  # type: ignore[import-not-found]
     token = os.environ.get("HF_TOKEN")
     if not token:
         return None
@@ -194,18 +194,26 @@ def forward_validates_target(
     reactant_smiles: list[str],
     target_smiles: str,
     reagent_smiles: list[str] | None = None,
-) -> bool:
+) -> bool | None:
     """
     Returns True if forward prediction of reactants recovers the target molecule.
-    Uses canonical SMILES comparison.
+    Returns None if the model is unavailable (so callers can treat as neutral).
+    Returns False if the model ran but the target was not among predicted products.
+
+    Checks the first (major) product of each beam candidate, since minor
+    byproducts are less relevant for validation.
     """
     target_canonical = _canonicalize(target_smiles)
     predicted_products = forward_predict(reactant_smiles, reagent_smiles, num_beams=5, num_return=5)
+
+    if not predicted_products:
+        return None  # model unavailable or failed
+
     for pred in predicted_products:
-        # Products may be multi-component; check if target is among them
-        for component in pred.split("."):
-            if _canonicalize(component) == target_canonical:
-                return True
+        # Check the first (major) component — byproducts are after "."
+        major_product = pred.split(".")[0].strip()
+        if _canonicalize(major_product) == target_canonical:
+            return True
     return False
 
 
@@ -215,7 +223,7 @@ def forward_validates_target(
 
 def _seq2seq_generate(model, tokenizer, input_text: str, num_beams: int, num_return: int) -> list[str]:
     """Run T5 seq2seq generation and decode output tokens."""
-    import torch
+    import torch  # type: ignore[import-not-found]
     try:
         inputs = tokenizer(
             input_text,
@@ -248,23 +256,27 @@ def _seq2seq_generate(model, tokenizer, input_text: str, num_beams: int, num_ret
 def _parse_yield(raw: str) -> float | None:
     """Parse a yield prediction string to a 0.0–1.0 float."""
     raw = raw.strip()
-    # Try direct float parse
-    try:
-        val = float(raw)
-        # Model outputs 0–100 range, normalize to 0–1
+
+    def _normalize(val: float) -> float:
+        if val > 100.0:
+            logger.warning("T5 yield prediction > 100%% (%s); clamping. Raw: %r", val, raw)
+        if val < 0:
+            logger.warning("T5 yield prediction < 0 (%s); clamping. Raw: %r", val, raw)
         if val > 1.0:
             val /= 100.0
         return max(0.0, min(1.0, val))
+
+    # Try direct float parse
+    try:
+        return _normalize(float(raw))
     except ValueError:
         pass
     # Extract first number from string
     match = re.search(r"[\d.]+", raw)
     if match:
         try:
-            val = float(match.group())
-            if val > 1.0:
-                val /= 100.0
-            return max(0.0, min(1.0, val))
+            return _normalize(float(match.group()))
         except ValueError:
             pass
+    logger.warning("Could not parse yield from T5 output: %r", raw)
     return None

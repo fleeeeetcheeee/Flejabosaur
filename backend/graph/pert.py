@@ -71,8 +71,20 @@ def run_pert(G: nx.DiGraph) -> PathwayPERT:
         db_yield = attrs.get("db_yield")
         if db_yield is not None:
             m = float(db_yield)
-            a = min(m + 0.15, 0.99)
-            b = max(m - 0.25, 0.05)
+            # Use reaction-class variance to set optimistic/pessimistic bounds
+            # rather than arbitrary offsets
+            default_a, default_m, default_b = DEFAULT_YIELDS.get(rname, DEFAULT_YIELD)
+            default_mu = (default_a + 4 * default_m + default_b) / 6
+            default_spread_up = default_a - default_mu if default_m else 0.10
+            default_spread_down = default_mu - default_b if default_m else 0.15
+            a = min(m + max(default_spread_up, 0.05), 0.99)
+            b = max(m - max(default_spread_down, 0.05), 0.01)
+
+        # Validate PERT bounds: a ≥ m ≥ b (optimistic ≥ likely ≥ pessimistic)
+        a = max(a, m)
+        b = min(b, m)
+        a = min(a, 0.99)
+        b = max(b, 0.01)
 
         mu = (a + 4 * m + b) / 6
         sigma2 = ((b - a) / 6) ** 2

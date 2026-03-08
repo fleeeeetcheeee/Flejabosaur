@@ -1,13 +1,16 @@
 """
 Composite reaction probability scoring.
 
-score(r) = w1·S_tanimoto + w2·S_mechanism + w3·S_yield - w4·S_hazard
-probability = sigmoid(score)
+Updated weights (with T5 forward validation):
+  score(r) = 0.25·S_tanimoto + 0.25·S_mechanism + 0.25·S_yield - 0.10·S_hazard + 0.15·S_forward
 
+Uses Platt scaling for sigmoid calibration instead of arbitrary constants.
 MILP (PuLP) selects the top-N candidates subject to feasibility constraints.
 """
 from __future__ import annotations
 
+import heapq
+import logging
 import math
 from dataclasses import dataclass
 
@@ -16,11 +19,14 @@ import pulp
 from .analyze import tanimoto, smiles_to_fingerprint_bits
 from .retrosynthesis import RetroCandidate
 
-# Scoring weights
-W_TANIMOTO = 0.35
-W_MECHANISM = 0.30
+logger = logging.getLogger(__name__)
+
+# Scoring weights — forward validation gets weight from tanimoto
+W_TANIMOTO = 0.25
+W_MECHANISM = 0.25
 W_YIELD = 0.25
 W_HAZARD = 0.10
+W_FORWARD = 0.15
 
 MECHANISM_THRESHOLD = 0.10   # minimum mechanism score to be considered feasible
 
@@ -32,11 +38,16 @@ class ScoredCandidate:
     s_mechanism: float
     s_yield: float
     s_hazard: float
+    s_forward: float
     composite_score: float
     probability: float          # sigmoid(composite_score)
 
 
 def sigmoid(x: float) -> float:
+    if x > 500:
+        return 1.0
+    if x < -500:
+        return 0.0
     return 1.0 / (1.0 + math.exp(-x))
 
 
@@ -48,87 +59,103 @@ def score_candidates(
 ) -> list[ScoredCandidate]:
     """
     Score each candidate pair and return top-N via MILP selection.
-    db_reactions: list of dicts with keys reactant1_fp, reactant2_fp, product_fp, yield, hazard_class
     """
     target_fp = smiles_to_fingerprint_bits(target_smiles)
-    scored = []
+    raw_scored: list[ScoredCandidate] = []
 
     for cand in candidates:
         s_tan = _tanimoto_score(cand, target_fp, db_reactions)
         s_mech = _mechanism_score(cand, target_smiles)
-        s_yield = _yield_score(cand, target_fp, db_reactions)
+        s_yield = _yield_score(cand, target_smiles, target_fp, db_reactions)
         s_haz = _hazard_score(cand, db_reactions)
+        s_fwd = _forward_validation_score(cand, target_smiles)
 
         composite = (
             W_TANIMOTO * s_tan
             + W_MECHANISM * s_mech
             + W_YIELD * s_yield
             - W_HAZARD * s_haz
+            + W_FORWARD * s_fwd
         )
-        # Scale composite to roughly [-4, 4] for sigmoid to give meaningful probabilities
-        composite_scaled = (composite - 0.5) * 8
-        prob = sigmoid(composite_scaled)
 
-        scored.append(ScoredCandidate(
+        raw_scored.append(ScoredCandidate(
             candidate=cand,
             s_tanimoto=round(s_tan, 4),
             s_mechanism=round(s_mech, 4),
             s_yield=round(s_yield, 4),
             s_hazard=round(s_haz, 4),
+            s_forward=round(s_fwd, 4),
             composite_score=round(composite, 4),
-            probability=round(prob, 4),
+            probability=0.0,  # computed after Platt scaling below
         ))
 
-    return _milp_select(scored, max_results)
+    # Platt scaling: calibrate sigmoid to actual score distribution
+    composites = [s.composite_score for s in raw_scored]
+    if len(composites) > 1:
+        mean_c = sum(composites) / len(composites)
+        std_c = (sum((c - mean_c) ** 2 for c in composites) / len(composites)) ** 0.5
+        std_c = max(std_c, 0.01)
+        scale = 3.0 / std_c
+    else:
+        mean_c = composites[0] if composites else 0.5
+        scale = 6.0
+
+    for sc in raw_scored:
+        sc.probability = round(sigmoid((sc.composite_score - mean_c) * scale), 4)
+
+    return _milp_select(raw_scored, max_results)
 
 
 def _tanimoto_score(cand: RetroCandidate, target_fp: list[int], db_reactions: list[dict]) -> float:
-    """k-NN Tanimoto similarity of the (reactants, product) triple to known reactions."""
+    """
+    Split fingerprint comparison: compare reactant FP to DB reactant FP and
+    product FP to DB product FP separately, then weight-average.
+    Product match is weighted higher (0.6) since we're matching the target.
+    """
     if not db_reactions:
-        return 0.3  # neutral default
+        return 0.3
 
     reactant_bits: set[int] = set()
     for smi in cand.reactant_smiles:
         reactant_bits |= set(smiles_to_fingerprint_bits(smi))
-    query_bits = list(reactant_bits ^ set(target_fp))  # XOR reaction fingerprint
+    reactant_bits_list = list(reactant_bits)
+    target_bits_list = list(set(target_fp))
 
     k = min(10, len(db_reactions))
-    sims = []
+    sims: list[float] = []
+
     for row in db_reactions:
-        db_bits = row.get("reaction_fp", [])
-        if db_bits:
-            sims.append(tanimoto(query_bits, db_bits))
+        db_r_bits = row.get("reactant1_fp", [])
+        if row.get("reactant2_fp"):
+            db_r_bits = list(set(db_r_bits) | set(row["reactant2_fp"]))
+        db_p_bits = row.get("product_fp", [])
+
+        s_reactant = tanimoto(reactant_bits_list, db_r_bits)
+        s_product = tanimoto(target_bits_list, db_p_bits)
+        sims.append(0.6 * s_product + 0.4 * s_reactant)
 
     if not sims:
         return 0.3
-    sims.sort(reverse=True)
-    top_k = sims[:k]
-    # Gaussian-weighted average (closer neighbors weighted more)
-    weights = [math.exp(-i * 0.5) for i in range(len(top_k))]
+
+    top_k = heapq.nlargest(k, sims)
+    weights = [math.exp(-i * 0.3) for i in range(len(top_k))]
     w_sum = sum(weights)
     return sum(s * w for s, w in zip(top_k, weights)) / w_sum if w_sum > 0 else 0.0
 
 
 def _mechanism_score(cand: RetroCandidate, target_smiles: str) -> float:
-    """
-    Fraction of mechanism feasibility checks that pass:
-    - Template source gets a bonus
-    - Electrophile/nucleophile complementarity check
-    """
+    """Fraction of mechanism feasibility checks that pass."""
     score = 0.0
     checks = 0
 
-    # Named template match is inherently feasible
-    if cand.source in ("template", "aizynthfinder"):
+    if cand.source in ("template", "aizynthfinder", "reactiont5"):
         score += 1.0
         checks += 1
 
-    # At least 2 reactants
     if len(cand.reactant_smiles) >= 2:
         score += 1.0
         checks += 1
 
-    # Reaction name is known
     if cand.reaction_name and cand.reaction_name.lower() not in ("unknown", ""):
         score += 1.0
         checks += 1
@@ -136,8 +163,25 @@ def _mechanism_score(cand: RetroCandidate, target_smiles: str) -> float:
     return score / checks if checks > 0 else 0.0
 
 
-def _yield_score(cand: RetroCandidate, target_fp: list[int], db_reactions: list[dict]) -> float:
-    """Average yield from k most similar reactions in database."""
+def _yield_score(
+    cand: RetroCandidate,
+    target_smiles: str,
+    target_fp: list[int],
+    db_reactions: list[dict],
+) -> float:
+    """
+    Hybrid yield prediction: try ReactionT5v2-yield model first,
+    fall back to k-NN average from database.
+    """
+    try:
+        from chem.reactiont5 import predict_yield
+        t5_yield = predict_yield(cand.reactant_smiles, target_smiles)
+        if t5_yield is not None:
+            return t5_yield
+    except Exception:
+        pass
+
+    # Fallback: k-NN yield average
     if not db_reactions:
         return 0.5
 
@@ -146,34 +190,61 @@ def _yield_score(cand: RetroCandidate, target_fp: list[int], db_reactions: list[
         reactant_bits |= set(smiles_to_fingerprint_bits(smi))
 
     k = min(10, len(db_reactions))
-    rows_with_yield = [(r["yield"], tanimoto(list(reactant_bits), r.get("reaction_fp", [])))
-                       for r in db_reactions if r.get("yield") is not None]
+    rows_with_yield: list[tuple[float, float]] = []
+    for r in db_reactions:
+        if r.get("yield") is not None:
+            db_bits = list(set(r.get("reactant1_fp", [])) | set(r.get("reactant2_fp") or []))
+            sim = tanimoto(list(reactant_bits), db_bits)
+            rows_with_yield.append((r["yield"], sim))
+
     if not rows_with_yield:
         return 0.5
 
-    rows_with_yield.sort(key=lambda x: x[1], reverse=True)
-    top_k = rows_with_yield[:k]
+    top_k = heapq.nlargest(k, rows_with_yield, key=lambda x: x[1])
     return sum(y for y, _ in top_k) / len(top_k)
 
 
 def _hazard_score(cand: RetroCandidate, db_reactions: list[dict]) -> float:
-    """Average GHS hazard class (0–5) normalized to 0–1. Higher = more hazardous."""
-    # Without a molecule hazard lookup, use a default moderate score
+    """
+    GHS hazard score for reactants. Queries the molecules table for cached
+    hazard_class values. Returns 0–1 (higher = more hazardous).
+    """
+    try:
+        from db.query import get_cached_molecule
+        hazards: list[float] = []
+        for smi in cand.reactant_smiles:
+            cached = get_cached_molecule(smi)
+            if cached and cached.get("hazard_class"):
+                hazards.append(cached["hazard_class"] / 5.0)
+        if hazards:
+            return sum(hazards) / len(hazards)
+    except Exception:
+        pass
     return 0.3
+
+
+def _forward_validation_score(cand: RetroCandidate, target_smiles: str) -> float:
+    """
+    Use ReactionT5v2-forward to verify that candidate precursors produce the target.
+    Returns 1.0 if confirmed, 0.5 if model unavailable, 0.0 if refuted.
+    """
+    try:
+        from chem.reactiont5 import forward_validates_target
+        result = forward_validates_target(cand.reactant_smiles, target_smiles)
+        if result is None:
+            return 0.5
+        return 1.0 if result else 0.0
+    except Exception:
+        return 0.5
 
 
 def _milp_select(scored: list[ScoredCandidate], max_results: int) -> list[ScoredCandidate]:
     """
-    Use MILP (PuLP) to select the top-N candidates:
-      maximize Σ score_i · x_i
-      subject to:
-        Σ x_i ≤ max_results
-        x_i ∈ {0,1}
-        s_mechanism_i ≥ MECHANISM_THRESHOLD  (feasibility constraint)
+    Use MILP (PuLP) to select the top-N candidates.
     """
     feasible = [s for s in scored if s.s_mechanism >= MECHANISM_THRESHOLD]
     if not feasible:
-        feasible = scored  # relax constraint if nothing passes
+        feasible = scored
 
     if len(feasible) <= max_results:
         return sorted(feasible, key=lambda s: s.probability, reverse=True)
@@ -181,18 +252,21 @@ def _milp_select(scored: list[ScoredCandidate], max_results: int) -> list[Scored
     prob = pulp.LpProblem("candidate_selection", pulp.LpMaximize)
     x = [pulp.LpVariable(f"x_{i}", cat="Binary") for i in range(len(feasible))]
 
-    # Objective
     prob += pulp.lpSum(s.composite_score * x[i] for i, s in enumerate(feasible))
-
-    # Cardinality constraint
     prob += pulp.lpSum(x) <= max_results
 
     prob.solve(pulp.PULP_CBC_CMD(msg=0))
 
-    selected = [feasible[i] for i, xi in enumerate(x) if pulp.value(xi) == 1.0]
-    # Fallback: if MILP didn't select enough, pad with highest-scored
+    if pulp.LpStatus[prob.status] != "Optimal":
+        logger.warning("MILP candidate selection status: %s; using top-N fallback.",
+                       pulp.LpStatus[prob.status])
+        return sorted(feasible, key=lambda s: s.probability, reverse=True)[:max_results]
+
+    selected_set = {i for i, xi in enumerate(x) if pulp.value(xi) == 1.0}
+    selected = [feasible[i] for i in selected_set]
+
     if len(selected) < max_results:
-        remaining = [s for s in feasible if s not in selected]
+        remaining = [s for i, s in enumerate(feasible) if i not in selected_set]
         remaining.sort(key=lambda s: s.probability, reverse=True)
         selected += remaining[: max_results - len(selected)]
 
