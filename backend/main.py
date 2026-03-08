@@ -15,7 +15,7 @@ from chem.iupac import iupac_to_smiles
 from chem.analyze import analyze, MolecularAnalysis
 from chem.retrosynthesis import get_retro_candidates
 from chem.scoring import score_candidates, ScoredCandidate
-from graph.dag import build_synthesis_dag, dag_to_dict
+from graph.dag import build_retro_tree, build_synthesis_dag, dag_to_dict, topological_order
 from graph.cpm import run_cpm
 from graph.pert import run_pert
 from graph.milp import select_optimal_pathway
@@ -76,6 +76,7 @@ class ScoreBreakdown(BaseModel):
     mechanism: float
     yield_score: float
     hazard: float
+    forward: float
 
 
 class PrecursorPair(BaseModel):
@@ -171,6 +172,7 @@ def scored_to_pair(sc: ScoredCandidate) -> PrecursorPair:
             mechanism=sc.s_mechanism,
             yield_score=sc.s_yield,
             hazard=sc.s_hazard,
+            forward=sc.s_forward,
         ),
         source=sc.candidate.source,
     )
@@ -233,29 +235,17 @@ async def multistep(req: MultistepRequest) -> MultistepResponse:
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    # Collect retrosynthetic candidates for each step
-    candidates_per_step = []
-    current_smiles_list = [smiles]
+    # Build per-molecule retrosynthetic tree (fixes Cartesian product bug)
+    retro_tree = build_retro_tree(
+        smiles,
+        max_depth=req.max_steps,
+        max_candidates_per_molecule=req.max_candidates_per_step,
+    )
 
-    for step in range(req.max_steps):
-        step_candidates = []
-        for smi in current_smiles_list:
-            cands = get_retro_candidates(smi, max_candidates=req.max_candidates_per_step)
-            step_candidates.extend(cands)
-        candidates_per_step.append(step_candidates)
-        # Next layer: all precursors from this step
-        next_smiles = []
-        for c in step_candidates:
-            next_smiles.extend(c.reactant_smiles)
-        current_smiles_list = list(set(next_smiles))
-        if not current_smiles_list:
-            break
-
-    # Build DAG
-    G = build_synthesis_dag(smiles, candidates_per_step)
+    # Build DAG from tree
+    G = build_synthesis_dag(smiles, retro_tree)
 
     # Topological order
-    from graph.dag import topological_order
     topo = topological_order(G)
 
     # CPM
@@ -264,7 +254,11 @@ async def multistep(req: MultistepRequest) -> MultistepResponse:
     # PERT
     pert_result = run_pert(G)
 
-    # MILP pathway selection
+    # Annotate DAG edges with PERT-computed mu values before MILP
+    for (src, dst, attrs), step in zip(G.edges(data=True), pert_result.steps):
+        attrs["mu"] = step.mu
+
+    # MILP pathway selection (now uses real mu values)
     milp_result = select_optimal_pathway(G, smiles)
 
     # Serialize DAG for React Flow
@@ -272,8 +266,11 @@ async def multistep(req: MultistepRequest) -> MultistepResponse:
 
     # Annotate critical edges in DAG dict
     critical_edge_set = {(e.src, e.dst) for e in cpm_edges if e.is_critical}
+    optimal_edge_set = set(milp_result.selected_edges)
     for edge in dag_dict["edges"]:
-        edge["data"]["isCritical"] = (edge["source"], edge["target"]) in critical_edge_set
+        edge_key = (edge["source"], edge["target"])
+        edge["data"]["isCritical"] = edge_key in critical_edge_set
+        edge["data"]["isOptimal"] = edge_key in optimal_edge_set
 
     return MultistepResponse(
         smiles=smiles,

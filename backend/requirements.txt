@@ -9,5 +9,7 @@ numpy==1.26.4
 scipy==1.13.1
 pydantic==2.8.2
 python-multipart==0.0.9
+transformers>=4.40.0
+torch>=2.0.0
 pytest==8.3.2
 pytest-asyncio==0.23.8

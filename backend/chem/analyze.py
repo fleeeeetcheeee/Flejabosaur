@@ -13,8 +13,8 @@ from rdkit.Chem import Descriptors, rdMolDescriptors, AllChem, rdPartialCharges
 from rdkit.Chem.Draw import rdMolDraw2D
 
 
-# Common functional groups as SMARTS patterns
-FUNCTIONAL_GROUPS: dict[str, str] = {
+# Common functional groups as SMARTS patterns — precompiled at module load
+_FUNCTIONAL_GROUP_DEFS: dict[str, str] = {
     "alcohol": "[OX2H]",
     "aldehyde": "[CX3H1](=O)[#6]",
     "ketone": "[CX3](=O)([#6])[#6]",
@@ -33,6 +33,19 @@ FUNCTIONAL_GROUPS: dict[str, str] = {
     "epoxide": "[C1OC1]",
     "sulfide": "[#16X2]([#6])[#6]",
     "phosphate": "[PX4](=O)([OX2H])([OX2H])[OX2]",
+}
+
+# Precompile SMARTS patterns once (avoids recompilation per molecule)
+FUNCTIONAL_GROUPS: dict[str, Chem.rdchem.Mol] = {}
+for _fg_name, _fg_smarts in _FUNCTIONAL_GROUP_DEFS.items():
+    _pat = Chem.MolFromSmarts(_fg_smarts)
+    if _pat is not None:
+        FUNCTIONAL_GROUPS[_fg_name] = _pat
+
+# Pauling electronegativities for oxidation state calculation
+_ELECTRONEGATIVITIES: dict[int, float] = {
+    1: 2.20, 5: 2.04, 6: 2.55, 7: 3.04, 8: 3.44, 9: 3.98,
+    14: 1.90, 15: 2.19, 16: 2.58, 17: 3.16, 35: 2.96, 53: 2.66,
 }
 
 
@@ -86,10 +99,11 @@ def analyze(smiles: str) -> MolecularAnalysis:
     if mol is None:
         raise ValueError(f"Invalid SMILES: {smiles!r}")
 
-    # Sanitize and add Hs for charge calculation (then remove for descriptors)
-    mol = Chem.AddHs(mol)
-    rdPartialCharges.ComputeGasteigerCharges(mol)
+    # FIX: Compute Gasteiger charges on the final heavy-atom molecule directly.
+    # Previously charges were computed on Hs-included mol then RemoveHs() created
+    # a new mol object where the _GasteigerCharge properties didn't transfer.
     mol_noH = Chem.RemoveHs(mol)
+    rdPartialCharges.ComputeGasteigerCharges(mol_noH)
 
     # Molecular descriptors
     mw = Descriptors.MolWt(mol_noH)
@@ -101,14 +115,15 @@ def analyze(smiles: str) -> MolecularAnalysis:
     rings = rdMolDescriptors.CalcNumRings(mol_noH)
     arom_rings = rdMolDescriptors.CalcNumAromaticRings(mol_noH)
 
-    # Atom features
+    # Atom features — collect charges first for percentile-based site detection
     atom_features = []
-    elec_sites = []
-    nucl_sites = []
+    charges: list[float] = []
     for atom in mol_noH.GetAtoms():
         charge = float(atom.GetPropsAsDict().get("_GasteigerCharge", 0.0))
         if math.isnan(charge):
             charge = 0.0
+        charges.append(charge)
+
         oxstate = _oxidation_state(atom)
         af = AtomFeatures(
             idx=atom.GetIdx(),
@@ -124,12 +139,22 @@ def analyze(smiles: str) -> MolecularAnalysis:
             oxidation_state=oxstate,
         )
         atom_features.append(af)
-        # Electrophilic: positive Gasteiger charge (electron-poor)
-        if charge > 0.1:
-            elec_sites.append(atom.GetIdx())
-        # Nucleophilic: negative Gasteiger charge (electron-rich)
-        if charge < -0.1:
-            nucl_sites.append(atom.GetIdx())
+
+    # FIX: Percentile-based electrophilic/nucleophilic site detection.
+    # Previous fixed thresholds (±0.1) missed sites in molecules with
+    # uniformly distributed charges.
+    elec_sites: list[int] = []
+    nucl_sites: list[int] = []
+    if charges:
+        sorted_charges = sorted(charges)
+        n = len(sorted_charges)
+        elec_threshold = sorted_charges[-max(1, n // 5)]  # top 20%
+        nucl_threshold = sorted_charges[max(0, n // 5 - 1)]  # bottom 20%
+        for i, charge in enumerate(charges):
+            if charge >= elec_threshold and charge > 0:
+                elec_sites.append(i)
+            if charge <= nucl_threshold and charge < 0:
+                nucl_sites.append(i)
 
     # Bond features
     bond_features = []
@@ -144,11 +169,10 @@ def analyze(smiles: str) -> MolecularAnalysis:
         )
         bond_features.append(bf)
 
-    # Functional groups
+    # Functional groups (using precompiled SMARTS)
     fg_present = []
-    for name, smarts in FUNCTIONAL_GROUPS.items():
-        pattern = Chem.MolFromSmarts(smarts)
-        if pattern and mol_noH.HasSubstructMatch(pattern):
+    for name, pattern in FUNCTIONAL_GROUPS.items():
+        if mol_noH.HasSubstructMatch(pattern):
             fg_present.append(name)
 
     # ECFP4 Morgan fingerprint (non-zero bit indices)
@@ -179,21 +203,55 @@ def analyze(smiles: str) -> MolecularAnalysis:
 
 
 def _oxidation_state(atom) -> int:
-    """Estimate oxidation state from formal charge and bond types."""
-    valence = atom.GetTotalValence()
-    bonds_to_heteroatom = sum(
-        1 for bond in atom.GetBonds()
-        if bond.GetOtherAtom(atom).GetAtomicNum() in (7, 8, 9, 16, 17, 35, 53)
-    )
-    return atom.GetFormalCharge() + bonds_to_heteroatom - (valence - atom.GetDegree())
+    """
+    Electronegativity-based oxidation state estimation (Allen's algorithm).
+
+    For each bond, the more electronegative atom is assigned all the bonding
+    electrons. The oxidation state = group valence electrons − assigned electrons.
+    This correctly handles cases like ketone C (→ +2) and carboxylic acid C (→ +3).
+    """
+    atomic_num = atom.GetAtomicNum()
+    own_en = _ELECTRONEGATIVITIES.get(atomic_num, 2.0)
+
+    # Count electrons this atom "owns" from its bonds
+    owned_electrons = 0
+    for bond in atom.GetBonds():
+        other = bond.GetOtherAtom(atom)
+        other_en = _ELECTRONEGATIVITIES.get(other.GetAtomicNum(), 2.0)
+        bond_order = int(bond.GetBondTypeAsDouble())
+        if own_en > other_en:
+            # This atom is more electronegative → it owns all bonding electrons
+            owned_electrons += 2 * bond_order
+        elif own_en == other_en:
+            # Equal electronegativity → split the electrons
+            owned_electrons += bond_order  # half of 2*bond_order
+
+    # Lone-pair / non-bonding electrons: total valence electrons − bonding electrons
+    # For this atom's contribution to bonds where it's LESS electronegative, it
+    # contributed electrons but doesn't own them in the oxidation state model.
+    # Hydrogen bonds: each H bonded counts as owned (H is less electronegative than C,N,O,etc.)
+    owned_electrons += atom.GetTotalNumHs()  # H electrons "owned" by atom (only if atom more EN than H)
+    if own_en <= _ELECTRONEGATIVITIES.get(1, 2.20):
+        # Atom is not more EN than H, so it doesn't own H electrons
+        owned_electrons -= atom.GetTotalNumHs()
+
+    # Group valence electrons for the neutral atom
+    pt = Chem.GetPeriodicTable()
+    group_valence = pt.GetNOuterElecs(atomic_num)
+
+    # Oxidation state = group_valence − owned_electrons + formal_charge
+    return group_valence - owned_electrons + atom.GetFormalCharge()
 
 
 def _mol_to_svg(mol, width: int = 300, height: int = 200) -> str:
-    drawer = rdMolDraw2D.MolDraw2DSVG(width, height)
-    drawer.drawOptions().addStereoAnnotation = True
-    drawer.DrawMolecule(mol)
-    drawer.FinishDrawing()
-    return drawer.GetDrawingText()
+    try:
+        drawer = rdMolDraw2D.MolDraw2DSVG(width, height)
+        drawer.drawOptions().addStereoAnnotation = True
+        drawer.DrawMolecule(mol)
+        drawer.FinishDrawing()
+        return drawer.GetDrawingText()
+    except Exception:
+        return ""
 
 
 def smiles_to_fingerprint_bits(smiles: str) -> list[int]:

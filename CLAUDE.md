@@ -51,26 +51,35 @@ User (IUPAC name)
 | `backend/main.py` | FastAPI app, routes: `POST /synthesize`, `POST /multistep`, `GET /molecule/{smiles}` |
 | `backend/chem/iupac.py` | IUPAC name → SMILES (PubChem REST primary, OPSIN subprocess fallback) |
 | `backend/chem/analyze.py` | RDKit: atom features, Gasteiger charges, ECFP4 fingerprint, functional group SMARTS |
-| `backend/chem/retrosynthesis.py` | AiZynthFinder wrapper; fallback: SMARTS template matching for common named reactions |
-| `backend/chem/scoring.py` | Composite score: Tanimoto (w=0.35) + mechanism (w=0.30) + yield (w=0.25) - hazard (w=0.10); PuLP MILP selects top-N |
-| `backend/graph/dag.py` | Build NetworkX DiGraph from AiZynthFinder synthesis tree |
+| `backend/chem/retrosynthesis.py` | 3-tier retro: AiZynthFinder MCTS → ReactionT5v2 beam search → SMARTS templates |
+| `backend/chem/reactiont5.py` | ReactionT5v2 integration: retrosynthesis, yield prediction, forward validation (HuggingFace) |
+| `backend/chem/scoring.py` | Composite score: Tanimoto (w=0.25) + mechanism (w=0.30) + yield (w=0.20) + forward (w=0.15) - hazard (w=0.10); Platt-scaled sigmoid |
+| `backend/graph/dag.py` | Build per-molecule retro tree → NetworkX DiGraph (avoids Cartesian product) |
 | `backend/graph/cpm.py` | Critical Path Method: forward/backward pass over reaction DAG |
 | `backend/graph/pert.py` | PERT: μ = (a+4m+b)/6, σ²=((b-a)/6)², cumulative pathway probability |
 | `backend/graph/milp.py` | PuLP MILP: maximize log-yield − hazard − cost over pathway selection |
 | `backend/db/schema.sql` | SQLite tables: `reactions` (with serialized FP BLOBs), `molecules` |
 | `backend/db/loader.py` | Parse Figshare Reactron CSV → compute RDKit FPs → insert into SQLite |
 | `backend/db/query.py` | Tanimoto k-NN search (k=10) against reactions table |
-| `frontend/app/page.tsx` | Landing: IUPAC input + 2D structure preview |
-| `frontend/app/results/page.tsx` | Top-3 precursor pair cards with probability bars |
-| `frontend/app/synthesis/page.tsx` | Interactive React Flow synthesis DAG |
-| `frontend/components/MoleculeViewer.tsx` | smiles-drawer wrapper for 2D structure rendering |
-| `frontend/components/SynthesisDAG.tsx` | React Flow DAG with critical path highlighting |
+| `frontend/src/app/page.tsx` | Landing: IUPAC search with PubChem autocomplete + 12-molecule quick-pick gallery |
+| `frontend/src/app/results/page.tsx` | Single-step results: target card + ranked precursor pairs with radar charts |
+| `frontend/src/app/multistep/page.tsx` | Multi-step DAG: React Flow visualization with yield-colored edges, CPM/MILP overlays |
+| `frontend/src/components/MoleculeCard.tsx` | Molecule properties card with inline SVG, functional group badges |
+| `frontend/src/components/ScoreRadar.tsx` | Recharts radar chart for 5-axis score breakdown |
+| `frontend/src/components/PrecursorCard.tsx` | Precursor pair display with reaction conditions + radar |
+| `frontend/src/components/LoadingSkeleton.tsx` | Animated step indicators during API calls |
+| `frontend/src/lib/api.ts` | API client: synthesize, multistep, PubChem autocomplete |
 
 ### Scoring formula
 ```
-score(r) = 0.35·S_tanimoto + 0.30·S_mechanism + 0.25·S_yield − 0.10·S_hazard
-probability = sigmoid(score)
+score(r) = 0.25·S_tanimoto + 0.30·S_mechanism + 0.20·S_yield + 0.15·S_forward − 0.10·S_hazard
+probability = sigmoid(Platt_scale(score))
 ```
+
+### Retrosynthesis priority
+1. AiZynthFinder (MCTS, most accurate)
+2. ReactionT5v2-retrosynthesis (T5 seq2seq beam search)
+3. SMARTS template matching (14 named reactions, always-available fallback)
 
 ### Graph theory in use
 - **Topological sort** (`networkx.topological_sort`): valid reaction ordering in synthesis DAG

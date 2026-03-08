@@ -5,8 +5,10 @@ Each reaction edge has:
   duration_h: estimated reaction time in hours (default 2.0)
   cost:       relative reagent cost (default 1.0)
 
-Forward pass: ES, EF
-Backward pass: LS, LF
+Forward pass:  ES_edge = max(EF of all incoming edges to src node)
+               EF_edge = ES_edge + duration
+Backward pass: LF_edge = min(LS of all outgoing edges from dst node)
+               LS_edge = LF_edge - duration
 Float = LF - EF
 Critical path = edges with float == 0
 """
@@ -41,12 +43,17 @@ def run_cpm(G: nx.DiGraph) -> tuple[list[EdgeCPM], list[str]]:
     Run CPM on synthesis DAG G.
     Returns (edge_data, critical_path_node_sequence).
     """
+    if not G.edges():
+        return [], list(G.nodes())
+
     topo = list(nx.topological_sort(G))
 
-    # Assign durations from edge attributes (or defaults)
+    # Build edge data from graph attributes
     edge_data: dict[tuple, EdgeCPM] = {}
     for src, dst, attrs in G.edges(data=True):
         conds = attrs.get("conditions", {})
+        if not isinstance(conds, dict):
+            conds = {}
         duration = float(conds.get("duration_h", DEFAULT_DURATION))
         cost = float(conds.get("cost", DEFAULT_COST))
         edge_data[(src, dst)] = EdgeCPM(
@@ -55,47 +62,62 @@ def run_cpm(G: nx.DiGraph) -> tuple[list[EdgeCPM], list[str]]:
             duration_h=duration, cost=cost,
         )
 
-    # Node earliest finish times
-    ef_node: dict[str, float] = {n: 0.0 for n in G.nodes()}
+    # -----------------------------------------------------------------------
+    # Forward pass: compute Earliest Start / Earliest Finish for each edge
+    # A node's "earliest availability" = max EF of all incoming edges
+    # -----------------------------------------------------------------------
+    node_earliest: dict[str, float] = {n: 0.0 for n in G.nodes()}
 
-    # Forward pass
     for node in topo:
-        # ES for all outgoing edges = max EF of predecessors
-        pred_ef = max((ef_node[p] for p in G.predecessors(node)), default=0.0)
-        ef_node[node] = pred_ef
+        # This node's earliest availability = max EF of incoming edges
+        incoming_efs = [edge_data[(p, node)].ef
+                        for p in G.predecessors(node)
+                        if (p, node) in edge_data]
+        node_earliest[node] = max(incoming_efs, default=0.0)
+
+        # Set ES/EF for all outgoing edges
         for dst in G.successors(node):
-            e = edge_data[(node, dst)]
-            e.es = pred_ef
-            e.ef = pred_ef + e.duration_h
-            ef_node[dst] = max(ef_node[dst], e.ef)
+            if (node, dst) in edge_data:
+                e = edge_data[(node, dst)]
+                e.es = node_earliest[node]
+                e.ef = e.es + e.duration_h
 
-    project_duration = max(ef_node.values(), default=0.0)
+    project_duration = max((e.ef for e in edge_data.values()), default=0.0)
 
-    # Backward pass
-    lf_node: dict[str, float] = {n: project_duration for n in G.nodes()}
+    # -----------------------------------------------------------------------
+    # Backward pass: compute Latest Start / Latest Finish for each edge
+    # A node's "latest need" = min LS of all outgoing edges
+    # -----------------------------------------------------------------------
+    node_latest: dict[str, float] = {n: project_duration for n in G.nodes()}
+
     for node in reversed(topo):
-        succ_ls = min((lf_node[s] for s in G.successors(node)), default=project_duration)
-        lf_node[node] = succ_ls
+        # This node's latest need = min LS of outgoing edges
+        outgoing_lss = [edge_data[(node, s)].ls
+                        for s in G.successors(node)
+                        if (node, s) in edge_data]
+        node_latest[node] = min(outgoing_lss, default=project_duration)
+
+        # Set LF/LS for all incoming edges
         for src in G.predecessors(node):
-            e = edge_data[(src, node)]
-            e.lf = succ_ls
-            e.ls = succ_ls - e.duration_h
-            lf_node[src] = min(lf_node[src], e.ls)
+            if (src, node) in edge_data:
+                e = edge_data[(src, node)]
+                e.lf = node_latest[node]
+                e.ls = e.lf - e.duration_h
 
     # Float and critical flag
     for e in edge_data.values():
         e.float_h = round(e.lf - e.ef, 6)
         e.is_critical = abs(e.float_h) < 1e-6
 
-    # Critical path node sequence
+    # Critical path node sequence (preserving topological order)
     critical_edges = [e for e in edge_data.values() if e.is_critical]
     if critical_edges:
-        critical_nodes: list[str] = []
+        critical_node_set: set[str] = set()
         for e in critical_edges:
-            if e.src not in critical_nodes:
-                critical_nodes.append(e.src)
-            if e.dst not in critical_nodes:
-                critical_nodes.append(e.dst)
+            critical_node_set.add(e.src)
+            critical_node_set.add(e.dst)
+        # Preserve topological order
+        critical_nodes = [n for n in topo if n in critical_node_set]
     else:
         critical_nodes = list(topo)
 

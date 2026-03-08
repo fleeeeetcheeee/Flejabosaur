@@ -58,64 +58,61 @@ def load_csv(path: Path, conn: sqlite3.Connection, source: str = "figshare_react
     skipped = 0
     with open(path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        rows = list(reader)
+        # Stream rows instead of loading all into memory
+        for row in reader:
+            # Flexible column name detection
+            r1 = (row.get("reactant1") or row.get("reactant1_smiles") or
+                   row.get("reactant") or row.get("REACTANT1") or "").strip()
+            r2 = (row.get("reactant2") or row.get("reactant2_smiles") or
+                   row.get("REACTANT2") or "").strip()
+            prod = (row.get("product") or row.get("product_smiles") or
+                    row.get("PRODUCT") or "").strip()
+            rtype = (row.get("reaction_type") or row.get("type") or row.get("TYPE") or "").strip()
+            yld_str = (row.get("yield") or row.get("YIELD") or "").strip()
+            temp_str = (row.get("temperature_c") or row.get("temp") or "").strip()
+            solvent = (row.get("solvent") or row.get("SOLVENT") or "").strip()
+            catalyst = (row.get("catalyst") or row.get("CATALYST") or "").strip()
+            mechanism = (row.get("mechanism") or row.get("mechanism_desc") or "").strip()
 
-    logger.info("Loaded %d rows from %s", len(rows), path)
+            if not r1 or not prod:
+                skipped += 1
+                continue
 
-    for row in rows:
-        # Flexible column name detection
-        r1 = (row.get("reactant1") or row.get("reactant1_smiles") or
-               row.get("reactant") or row.get("REACTANT1") or "").strip()
-        r2 = (row.get("reactant2") or row.get("reactant2_smiles") or
-               row.get("REACTANT2") or "").strip()
-        prod = (row.get("product") or row.get("product_smiles") or
-                row.get("PRODUCT") or "").strip()
-        rtype = (row.get("reaction_type") or row.get("type") or row.get("TYPE") or "").strip()
-        yld_str = (row.get("yield") or row.get("YIELD") or "").strip()
-        temp_str = (row.get("temperature_c") or row.get("temp") or "").strip()
-        solvent = (row.get("solvent") or row.get("SOLVENT") or "").strip()
-        catalyst = (row.get("catalyst") or row.get("CATALYST") or "").strip()
-        mechanism = (row.get("mechanism") or row.get("mechanism_desc") or "").strip()
+            # Compute fingerprints
+            r1_fp = smiles_to_fp_json(r1)
+            r2_fp = smiles_to_fp_json(r2) if r2 else None
+            prod_fp = smiles_to_fp_json(prod)
 
-        if not r1 or not prod:
-            skipped += 1
-            continue
+            if r1_fp is None or prod_fp is None:
+                skipped += 1
+                continue
 
-        # Compute fingerprints
-        r1_fp = smiles_to_fp_json(r1)
-        r2_fp = smiles_to_fp_json(r2) if r2 else None
-        prod_fp = smiles_to_fp_json(prod)
+            r1_bits = json.loads(r1_fp)
+            r2_bits = json.loads(r2_fp) if r2_fp else []
+            prod_bits = json.loads(prod_fp)
+            rxn_fp = reaction_fp_json(r1_bits, r2_bits, prod_bits)
 
-        if r1_fp is None or prod_fp is None:
-            skipped += 1
-            continue
+            yld = float(yld_str) if yld_str else None
+            if yld is not None and yld > 1.0:
+                yld /= 100.0   # convert % to fraction
 
-        r1_bits = json.loads(r1_fp)
-        r2_bits = json.loads(r2_fp) if r2_fp else []
-        prod_bits = json.loads(prod_fp)
-        rxn_fp = reaction_fp_json(r1_bits, r2_bits, prod_bits)
+            temp = float(temp_str) if temp_str else None
 
-        yld = float(yld_str) if yld_str else None
-        if yld is not None and yld > 1.0:
-            yld /= 100.0   # convert % to fraction
+            conn.execute(
+                """INSERT INTO reactions
+                   (reactant1_smiles, reactant2_smiles, product_smiles, reaction_type,
+                    mechanism_desc, yield, temperature_c, solvent, catalyst, source,
+                    reactant1_fp, reactant2_fp, product_fp, reaction_fp)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (r1, r2 or None, prod, rtype or None, mechanism or None,
+                 yld, temp, solvent or None, catalyst or None, source,
+                 r1_fp, r2_fp, prod_fp, rxn_fp),
+            )
+            loaded += 1
 
-        temp = float(temp_str) if temp_str else None
-
-        conn.execute(
-            """INSERT INTO reactions
-               (reactant1_smiles, reactant2_smiles, product_smiles, reaction_type,
-                mechanism_desc, yield, temperature_c, solvent, catalyst, source,
-                reactant1_fp, reactant2_fp, product_fp, reaction_fp)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (r1, r2 or None, prod, rtype or None, mechanism or None,
-             yld, temp, solvent or None, catalyst or None, source,
-             r1_fp, r2_fp, prod_fp, rxn_fp),
-        )
-        loaded += 1
-
-        if loaded % 1000 == 0:
-            conn.commit()
-            logger.info("  %d rows inserted...", loaded)
+            if loaded % 1000 == 0:
+                conn.commit()
+                logger.info("  %d rows inserted...", loaded)
 
     conn.commit()
     logger.info("Done: %d loaded, %d skipped", loaded, skipped)
