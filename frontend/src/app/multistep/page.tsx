@@ -75,7 +75,7 @@ function buildFlowGraph(data: MultistepResponse) {
       id: `e-${i}`,
       source: e.source,
       target: e.target,
-      label: `${e.data?.reaction_name ?? ""} (${(mu * 100).toFixed(0)}%)`,
+      label: `${e.data?.reaction_name?.replace(/_/g, " ") ?? "Unknown"} (${(mu * 100).toFixed(0)}%)`,
       labelStyle: { fontSize: 9, fill: "#a1a1aa" },
       style: {
         stroke: yieldColor(mu),

@@ -1,5 +1,5 @@
 """
-Flejabosaur — Retrosynthesis API
+ChemSynthe — Retrosynthesis API
 
 Unified FastAPI backend for HackTJ 13.0.
 
@@ -67,7 +67,7 @@ async def lifespan(application: FastAPI):  # noqa: ARG001
 
 
 app = FastAPI(
-    title="Flejabosaur Retrosynthesis API",
+    title="ChemSynthe Retrosynthesis API",
     version="1.0.0",
     lifespan=lifespan,
 )

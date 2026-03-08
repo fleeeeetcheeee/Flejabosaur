@@ -30,6 +30,18 @@ W_FORWARD = 0.15
 
 MECHANISM_THRESHOLD = 0.10   # minimum mechanism score to be considered feasible
 
+# Atom symbols considered hazardous for estimation when no DB data is available.
+# Halogens (F, Cl, Br, I) and common organometallics (Mg, Sn).
+_HAZARDOUS_ATOM_SYMBOLS: frozenset[str] = frozenset({"F", "Cl", "Br", "I", "Mg", "Sn"})
+
+# Try importing RDKit once at module level for reuse across scoring functions.
+try:
+    from rdkit import Chem as _Chem
+    _RDKIT_AVAILABLE = True
+except Exception:
+    _Chem = None  # type: ignore[assignment]
+    _RDKIT_AVAILABLE = False
+
 
 @dataclass
 class ScoredCandidate:
@@ -111,15 +123,17 @@ def _tanimoto_score(cand: RetroCandidate, target_fp: list[int], db_reactions: li
     Split fingerprint comparison: compare reactant FP to DB reactant FP and
     product FP to DB product FP separately, then weight-average.
     Product match is weighted higher (0.6) since we're matching the target.
+    When DB is empty, compute actual Tanimoto between candidate reactants and target.
     """
-    if not db_reactions:
-        return 0.3
-
     reactant_bits: set[int] = set()
     for smi in cand.reactant_smiles:
         reactant_bits |= set(smiles_to_fingerprint_bits(smi))
     reactant_bits_list = list(reactant_bits)
     target_bits_list = list(set(target_fp))
+
+    if not db_reactions:
+        # Compute actual Tanimoto similarity between reactant union FP and target FP
+        return tanimoto(reactant_bits_list, target_bits_list)
 
     k = min(10, len(db_reactions))
     sims: list[float] = []
@@ -135,7 +149,7 @@ def _tanimoto_score(cand: RetroCandidate, target_fp: list[int], db_reactions: li
         sims.append(0.6 * s_product + 0.4 * s_reactant)
 
     if not sims:
-        return 0.3
+        return tanimoto(reactant_bits_list, target_bits_list)
 
     top_k = heapq.nlargest(k, sims)
     weights = [math.exp(-i * 0.3) for i in range(len(top_k))]
@@ -160,6 +174,23 @@ def _mechanism_score(cand: RetroCandidate, target_smiles: str) -> float:
         score += 1.0
         checks += 1
 
+    # More conditions = more detailed = more likely to be a real reaction
+    if len(cand.conditions) >= 2:
+        score += 1.0
+        checks += 1
+
+    # Validate each reactant SMILES is a parseable molecule
+    if _RDKIT_AVAILABLE and cand.reactant_smiles:
+        valid_count = 0
+        for smi in cand.reactant_smiles:
+            try:
+                if _Chem.MolFromSmiles(smi) is not None:
+                    valid_count += 1
+            except Exception:
+                pass
+        score += valid_count / len(cand.reactant_smiles)
+        checks += 1
+
     return score / checks if checks > 0 else 0.0
 
 
@@ -171,7 +202,7 @@ def _yield_score(
 ) -> float:
     """
     Hybrid yield prediction: try ReactionT5v2-yield model first,
-    fall back to k-NN average from database.
+    fall back to k-NN average from database, then to DEFAULT_YIELDS lookup.
     """
     try:
         from chem.reactiont5 import predict_yield
@@ -182,32 +213,39 @@ def _yield_score(
         pass
 
     # Fallback: k-NN yield average
-    if not db_reactions:
-        return 0.5
+    if db_reactions:
+        reactant_bits: set[int] = set()
+        for smi in cand.reactant_smiles:
+            reactant_bits |= set(smiles_to_fingerprint_bits(smi))
 
-    reactant_bits: set[int] = set()
-    for smi in cand.reactant_smiles:
-        reactant_bits |= set(smiles_to_fingerprint_bits(smi))
+        k = min(10, len(db_reactions))
+        rows_with_yield: list[tuple[float, float]] = []
+        for r in db_reactions:
+            if r.get("yield") is not None:
+                db_bits = list(set(r.get("reactant1_fp", [])) | set(r.get("reactant2_fp") or []))
+                sim = tanimoto(list(reactant_bits), db_bits)
+                rows_with_yield.append((r["yield"], sim))
 
-    k = min(10, len(db_reactions))
-    rows_with_yield: list[tuple[float, float]] = []
-    for r in db_reactions:
-        if r.get("yield") is not None:
-            db_bits = list(set(r.get("reactant1_fp", [])) | set(r.get("reactant2_fp") or []))
-            sim = tanimoto(list(reactant_bits), db_bits)
-            rows_with_yield.append((r["yield"], sim))
+        if rows_with_yield:
+            top_k = heapq.nlargest(k, rows_with_yield, key=lambda x: x[1])
+            return sum(y for y, _ in top_k) / len(top_k)
 
-    if not rows_with_yield:
-        return 0.5
+    # Final fallback: look up reaction name in DEFAULT_YIELDS (from graph/pert.py)
+    try:
+        from graph.pert import DEFAULT_YIELDS, DEFAULT_YIELD
+        a, m, b = DEFAULT_YIELDS.get(cand.reaction_name, DEFAULT_YIELD)
+        return (a + 4 * m + b) / 6
+    except Exception:
+        pass
 
-    top_k = heapq.nlargest(k, rows_with_yield, key=lambda x: x[1])
-    return sum(y for y, _ in top_k) / len(top_k)
+    return 0.5
 
 
 def _hazard_score(cand: RetroCandidate, db_reactions: list[dict]) -> float:
     """
     GHS hazard score for reactants. Queries the molecules table for cached
     hazard_class values. Returns 0–1 (higher = more hazardous).
+    When no cached data is available, estimates hazard from atom types.
     """
     try:
         from db.query import get_cached_molecule
@@ -220,6 +258,28 @@ def _hazard_score(cand: RetroCandidate, db_reactions: list[dict]) -> float:
             return sum(hazards) / len(hazards)
     except Exception:
         pass
+
+    # Fallback: estimate hazard from atom types using RDKit
+    if _RDKIT_AVAILABLE:
+        try:
+            total_atoms = 0
+            hazardous_atoms = 0
+            for smi in cand.reactant_smiles:
+                mol = _Chem.MolFromSmiles(smi)
+                if mol is None:
+                    continue
+                for atom in mol.GetAtoms():
+                    total_atoms += 1
+                    if atom.GetSymbol() in _HAZARDOUS_ATOM_SYMBOLS:
+                        hazardous_atoms += 1
+            if total_atoms > 0:
+                ratio = hazardous_atoms / total_atoms
+                # Scale ratio to 0.1–0.5 range: multiply by 5 to make even a
+                # small fraction of hazardous atoms register, then cap at 0.5.
+                return 0.1 + 0.4 * min(ratio * 5, 1.0)
+        except Exception:
+            pass
+
     return 0.3
 
 
@@ -227,6 +287,7 @@ def _forward_validation_score(cand: RetroCandidate, target_smiles: str) -> float
     """
     Use ReactionT5v2-forward to verify that candidate precursors produce the target.
     Returns 1.0 if confirmed, 0.5 if model unavailable, 0.0 if refuted.
+    When model is unavailable, returns 0.6 for named reactions and 0.4 for unknown.
     """
     try:
         from chem.reactiont5 import forward_validates_target
@@ -235,7 +296,11 @@ def _forward_validation_score(cand: RetroCandidate, target_smiles: str) -> float
             return 0.5
         return 1.0 if result else 0.0
     except Exception:
-        return 0.5
+        pass
+
+    # Differentiate by whether we have a named reaction
+    is_named = bool(cand.reaction_name) and cand.reaction_name.lower() not in ("unknown", "")
+    return 0.6 if is_named else 0.4
 
 
 def _milp_select(scored: list[ScoredCandidate], max_results: int) -> list[ScoredCandidate]:

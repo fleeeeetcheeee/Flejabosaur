@@ -22,8 +22,8 @@ export default function MoleculeCard({ mol, label }: Props) {
           dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(mol.svg, { USE_PROFILES: { svg: true } }) }}
         />
       ) : (
-        <div className="h-24 flex items-center justify-center text-muted text-sm">
-          No structure
+        <div className="h-24 flex items-center justify-center text-muted text-sm bg-card-border/20 rounded-lg">
+          ⚗️ Structure unavailable
         </div>
       )}
       <p className="font-mono text-xs break-all text-muted">{mol.smiles}</p>
