@@ -80,7 +80,7 @@ def tanimoto_knn(
 
 def cache_molecule(
     smiles: str,
-    iupac_name: str | None = None,
+    iupac_name: str | None = None,  # always stored lowercase for consistent lookup
     mw: float | None = None,
     logp: float | None = None,
     tpsa: float | None = None,
@@ -93,7 +93,8 @@ def cache_molecule(
         """INSERT OR REPLACE INTO molecules
            (smiles, iupac_name, mw, logp, tpsa, hazard_class, pubchem_cid, svg)
            VALUES (?,?,?,?,?,?,?,?)""",
-        (smiles, iupac_name, mw, logp, tpsa, hazard_class, pubchem_cid, svg),
+        (smiles, iupac_name.lower() if iupac_name else None,
+         mw, logp, tpsa, hazard_class, pubchem_cid, svg),
     )
     conn.commit()
     conn.close()

@@ -98,8 +98,22 @@ def select_optimal_pathway(G: nx.DiGraph, target_smiles: str) -> PathwayMILP:
     selected = [r for r in reactions if pulp.value(x[r["idx"]]) == 1.0]
 
     if not selected:
-        # Fallback: pick all edges (trivial pathway)
-        selected = reactions
+        # Greedy fallback: find shortest path from any starting material to target
+        sources = [n for n in G.nodes() if G.nodes[n].get("is_starting_material")]
+        best_path: list[str] | None = None
+        for src_node in sources:
+            try:
+                path = nx.shortest_path(G, src_node, target_smiles)
+                if best_path is None or len(path) < len(best_path):
+                    best_path = path
+            except nx.NetworkXNoPath:
+                continue
+        if best_path and len(best_path) > 1:
+            path_edge_set = {(best_path[i], best_path[i + 1]) for i in range(len(best_path) - 1)}
+            selected = [r for r in reactions if (r["src"], r["dst"]) in path_edge_set]
+        else:
+            logger.warning("MILP: no valid pathway found to target %s", target_smiles)
+            selected = []
 
     obj_val = pulp.value(prob.objective) or 0.0
     log_yield_sum = sum(r["log_mu"] for r in selected)

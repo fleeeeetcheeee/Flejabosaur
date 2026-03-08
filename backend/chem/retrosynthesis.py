@@ -11,8 +11,8 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 
-from rdkit import Chem
-from rdkit.Chem import AllChem
+from rdkit import Chem  # type: ignore[import-not-found]
+from rdkit.Chem import AllChem  # type: ignore[import-not-found]
 
 logger = logging.getLogger(__name__)
 
@@ -52,11 +52,12 @@ RETRO_TEMPLATES: list[tuple] = [
         ["[CX3H](=O)", "[CX3](=O)[CX4H2]"],
         {"temperature_c": 25, "catalyst": "NaOH", "solvent": "H2O/EtOH"},
     ),
-    # Diels-Alder: cyclohexene → diene + dienophile
+    # Diels-Alder: any cyclohexene → diene + dienophile (no stereo restriction)
     (
         "Diels_Alder",
-        "[C@@H]1CC=CC[C@@H]1",
-        ["[CH2]=[CH][CH]=[CH2]", "[CH2]=[CH2]"],
+        
+        "C1CC=CCC1",
+        ["C=CC=C", "C=C"],
         {"temperature_c": 150, "solvent": "toluene"},
     ),
     # Grignard addition: alcohol → aldehyde/ketone + Grignard
@@ -66,18 +67,18 @@ RETRO_TEMPLATES: list[tuple] = [
         ["[CX3H](=O)", "[MgBr][#6]"],
         {"temperature_c": 0, "solvent": "Et2O", "catalyst": "Mg"},
     ),
-    # Suzuki coupling: biaryl → aryl halide + aryl boronic acid
+    # Suzuki coupling: any aryl-aryl bond → aryl halide + aryl boronic acid
     (
         "Suzuki_Coupling",
-        "c1ccc(-c2ccccc2)cc1",
-        ["c1ccc(Br)cc1", "c1ccc(B(O)O)cc1"],
+        "[c:1]-[c:2]",
+        ["[c:1][Br]", "[c:2]B(O)O"],
         {"temperature_c": 80, "catalyst": "Pd(PPh3)4", "solvent": "DMF/H2O", "base": "K2CO3"},
     ),
-    # Wittig reaction: alkene → aldehyde + phosphonium ylide
+    # Wittig reaction: alkene → aldehyde + phosphonium ylide (generic ylide)
     (
         "Wittig",
         "[CX3]=[CX3]",
-        ["[CX3H](=O)", "[CH2]=[P](c1ccccc1)(c1ccccc1)c1ccccc1"],
+        ["[CX3H](=O)", "[#6]=[P]"],
         {"temperature_c": 25, "solvent": "THF"},
     ),
     # Nucleophilic substitution (SN2): secondary alkyl → alkyl halide + nucleophile
@@ -132,7 +133,7 @@ RETRO_TEMPLATES: list[tuple] = [
 ]
 
 
-def get_retro_candidates(target_smiles: str, max_candidates: int = 5) -> list[RetroCandidate]:
+def get_retro_candidates(target_smiles: str, max_candidates: int = 5) -> "list[RetroCandidate]":
     """
     Generate retrosynthetic candidates for target_smiles.
 
@@ -146,7 +147,9 @@ def get_retro_candidates(target_smiles: str, max_candidates: int = 5) -> list[Re
     """
     candidates = _aizynthfinder_retro(target_smiles, max_candidates)
     if candidates:
-        return candidates[:max_candidates]
+        while len(candidates) > max_candidates:
+            candidates.pop()
+        return candidates
 
     # ReactionT5v2 retrosynthesis
     t5_candidates = _reactiont5_retro(target_smiles, max_candidates)
@@ -163,14 +166,16 @@ def get_retro_candidates(target_smiles: str, max_candidates: int = 5) -> list[Re
             seen_reactant_sets.add(key)
             merged.append(cand)
 
-    return merged[:max_candidates]
+    while len(merged) > max_candidates:
+        merged.pop()
+    return merged
 
 
-def _aizynthfinder_retro(smiles: str, max_candidates: int) -> list[RetroCandidate]:
+def _aizynthfinder_retro(smiles: str, max_candidates: int) -> "list[RetroCandidate]":
     """Wrap AiZynthFinder. Returns empty list if unavailable."""
     try:
-        from aizynthfinder.aizynthfinder import AiZynthFinder
-        from aizynthfinder.context.config import Configuration
+        from aizynthfinder.aizynthfinder import AiZynthFinder  # type: ignore[import-not-found]
+        from aizynthfinder.context.config import Configuration  # type: ignore[import-not-found]
 
         config = Configuration.from_dict({
             "finder": {"time_limit": 30, "max_transforms": 3},
@@ -200,7 +205,7 @@ def _aizynthfinder_retro(smiles: str, max_candidates: int) -> list[RetroCandidat
         return []
 
 
-def _reactiont5_retro(smiles: str, max_candidates: int) -> list[RetroCandidate]:
+def _reactiont5_retro(smiles: str, max_candidates: int) -> "list[RetroCandidate]":
     """
     Use ReactionT5v2-retrosynthesis to predict precursors for the given product SMILES.
 
@@ -213,7 +218,7 @@ def _reactiont5_retro(smiles: str, max_candidates: int) -> list[RetroCandidate]:
     for diverse functional groups.
     """
     try:
-        from chem.reactiont5 import retrosynthesis as t5_retro
+        from chem.reactiont5 import retrosynthesis as t5_retro  # type: ignore[import-not-found]
         beam_results = t5_retro(smiles, num_beams=max(5, max_candidates), num_return=max_candidates)
         candidates = []
         for beam_smiles in beam_results:
@@ -234,7 +239,7 @@ def _reactiont5_retro(smiles: str, max_candidates: int) -> list[RetroCandidate]:
         return []
 
 
-def _template_retro(smiles: str, max_candidates: int) -> list[RetroCandidate]:
+def _template_retro(smiles: str, max_candidates: int) -> "list[RetroCandidate]":
     """Match target against retrosynthetic SMARTS templates."""
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
@@ -247,7 +252,7 @@ def _template_retro(smiles: str, max_candidates: int) -> list[RetroCandidate]:
             continue
         if mol.HasSubstructMatch(pattern):
             # Build placeholder precursor SMILES from SMARTS (simplified)
-            precursor_smiles = []
+            precursor_smiles: list[str] = []
             for ps in precursor_smarts_list:
                 pmol = Chem.MolFromSmarts(ps)
                 if pmol:

@@ -1,6 +1,13 @@
 """
 Flejabosaur — Retrosynthesis API
-FastAPI backend
+
+Unified FastAPI backend for HackTJ 13.0.
+
+Endpoints:
+  POST /synthesize   — IUPAC name → top-N precursor pairs (single-step)
+  POST /multistep    — IUPAC name → full synthesis DAG with CPM/PERT/MILP
+  GET  /molecule/{s} — molecular properties + SVG for a SMILES string
+  GET  /health       — liveness check
 """
 from __future__ import annotations
 
@@ -8,34 +15,61 @@ import logging
 import sys
 from pathlib import Path
 
-# Ensure the backend/ directory is on sys.path so that bare imports like
-# `from chem.iupac import ...` resolve correctly when the server is started
-# from any working directory (e.g. `cd backend && uvicorn main:app --reload`
-# or `uvicorn backend.main:app` from the project root).
+# ---------------------------------------------------------------------------
+# Path setup — must run before any local imports so bare subpackage imports
+# (e.g. `from chem.iupac import ...`) resolve regardless of working directory.
+# ---------------------------------------------------------------------------
 _BACKEND_DIR = Path(__file__).parent
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
-from typing import Any
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from chem.iupac import iupac_to_smiles
 from chem.analyze import analyze, MolecularAnalysis
+from chem.iupac import iupac_to_smiles
 from chem.retrosynthesis import get_retro_candidates
-from chem.scoring import score_candidates, ScoredCandidate
-from graph.dag import build_synthesis_dag, dag_to_dict
+from chem.scoring import ScoredCandidate, score_candidates
+from db.query import (
+    cache_molecule,
+    ensure_db,
+    get_cached_smiles,
+    tanimoto_knn,
+)
 from graph.cpm import run_cpm
-from graph.pert import run_pert
+from graph.dag import (
+    build_retro_tree,
+    build_synthesis_dag,
+    dag_to_dict,
+    topological_order,
+)
 from graph.milp import select_optimal_pathway
-from db.query import ensure_db, tanimoto_knn, cache_molecule, get_cached_smiles, get_cached_molecule
+from graph.pert import run_pert
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Flejabosaur Retrosynthesis API", version="1.0.0")
+
+# ---------------------------------------------------------------------------
+# Application lifecycle
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(application: FastAPI):  # noqa: ARG001
+    """Startup / shutdown lifecycle hook (replaces deprecated on_event)."""
+    ensure_db()
+    logger.info("Database initialized.")
+    yield
+
+
+app = FastAPI(
+    title="Flejabosaur Retrosynthesis API",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -43,12 +77,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-@app.on_event("startup")
-async def startup() -> None:
-    ensure_db()
-    logger.info("Database initialized.")
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +115,7 @@ class ScoreBreakdown(BaseModel):
     mechanism: float
     yield_score: float
     hazard: float
+    forward: float
 
 
 class PrecursorPair(BaseModel):
@@ -121,16 +150,23 @@ class MultistepResponse(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
+_EMPTY_PROPS_DEFAULTS = dict(
+    mw=0.0, logp=0.0, tpsa=0.0, hbd=0, hba=0, rotatable_bonds=0,
+    num_rings=0, num_aromatic_rings=0, functional_groups=[],
+    electrophilic_sites=[], nucleophilic_sites=[], svg="",
+)
+
+
 async def resolve_smiles(iupac_name: str) -> str:
-    """Resolve IUPAC name to SMILES, using DB cache if available."""
+    """Resolve IUPAC name to SMILES, using DB cache when available."""
     cached = get_cached_smiles(iupac_name.lower())
     if cached:
         return cached
-    smiles = await iupac_to_smiles(iupac_name)
-    return smiles
+    return await iupac_to_smiles(iupac_name)
 
 
-def analysis_to_props(analysis: MolecularAnalysis) -> MoleculeProperties:
+def _analysis_to_props(analysis: MolecularAnalysis) -> MoleculeProperties:
+    """Convert internal MolecularAnalysis dataclass to the API response model."""
     return MoleculeProperties(
         smiles=analysis.smiles,
         mw=analysis.mw,
@@ -148,31 +184,24 @@ def analysis_to_props(analysis: MolecularAnalysis) -> MoleculeProperties:
     )
 
 
-def scored_to_pair(sc: ScoredCandidate) -> PrecursorPair:
-    reactants = sc.candidate.reactant_smiles
-    r_a_smiles = reactants[0] if reactants else ""
-    r_b_smiles = reactants[1] if len(reactants) > 1 else None
-
+def _safe_analyze(smiles: str) -> MoleculeProperties:
+    """Analyze a SMILES string, returning empty properties on failure."""
     try:
-        a_analysis = analysis_to_props(analyze(r_a_smiles))
-    except Exception:
-        a_analysis = MoleculeProperties(smiles=r_a_smiles, mw=0, logp=0, tpsa=0,
-                                         hbd=0, hba=0, rotatable_bonds=0, num_rings=0,
-                                         num_aromatic_rings=0, functional_groups=[],
-                                         electrophilic_sites=[], nucleophilic_sites=[], svg="")
-    b_analysis = None
-    if r_b_smiles:
-        try:
-            b_analysis = analysis_to_props(analyze(r_b_smiles))
-        except Exception:
-            b_analysis = MoleculeProperties(smiles=r_b_smiles, mw=0, logp=0, tpsa=0,
-                                             hbd=0, hba=0, rotatable_bonds=0, num_rings=0,
-                                             num_aromatic_rings=0, functional_groups=[],
-                                             electrophilic_sites=[], nucleophilic_sites=[], svg="")
+        return _analysis_to_props(analyze(smiles))
+    except ValueError:
+        logger.warning("Failed to analyze SMILES: %r", smiles)
+        return MoleculeProperties(smiles=smiles, **_EMPTY_PROPS_DEFAULTS)
+
+
+def _scored_to_pair(sc: ScoredCandidate) -> PrecursorPair:
+    """Convert a ScoredCandidate to the API response model."""
+    reactants = sc.candidate.reactant_smiles
+    r_a = reactants[0] if reactants else ""
+    r_b = reactants[1] if len(reactants) > 1 else None
 
     return PrecursorPair(
-        reactant_a=a_analysis,
-        reactant_b=b_analysis,
+        reactant_a=_safe_analyze(r_a),
+        reactant_b=_safe_analyze(r_b) if r_b else None,
         reaction_name=sc.candidate.reaction_name,
         conditions=sc.candidate.conditions,
         probability=sc.probability,
@@ -182,6 +211,7 @@ def scored_to_pair(sc: ScoredCandidate) -> PrecursorPair:
             mechanism=sc.s_mechanism,
             yield_score=sc.s_yield,
             hazard=sc.s_hazard,
+            forward=sc.s_forward,
         ),
         source=sc.candidate.source,
     )
@@ -193,22 +223,21 @@ def scored_to_pair(sc: ScoredCandidate) -> PrecursorPair:
 
 @app.post("/synthesize", response_model=SynthesizeResponse)
 async def synthesize(req: SynthesizeRequest) -> SynthesizeResponse:
-    """
-    Main endpoint: IUPAC name → top-N precursor pairs for the final synthesis step.
-    """
+    """IUPAC name → top-N precursor pairs for the final synthesis step."""
+
     # 1. IUPAC → SMILES
     try:
         smiles = await resolve_smiles(req.iupac_name)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
     # 2. Molecular analysis
     try:
         mol_analysis = analyze(smiles)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid molecule: {e}")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid molecule: {exc}")
 
-    # Cache molecule
+    # 3. Cache the target molecule
     cache_molecule(
         smiles=mol_analysis.smiles,
         iupac_name=req.iupac_name.lower(),
@@ -218,73 +247,72 @@ async def synthesize(req: SynthesizeRequest) -> SynthesizeResponse:
         svg=mol_analysis.svg,
     )
 
-    # 3. Retrosynthetic candidate generation
+    # 4. Retrosynthetic candidate generation (overgenerate, then select)
     candidates = get_retro_candidates(smiles, max_candidates=req.max_candidates * 3)
 
-    # 4. Database similarity search
+    # 5. Database similarity search for scoring context
     db_reactions = tanimoto_knn(mol_analysis.ecfp4, k=20)
 
-    # 5. Score and select via MILP
-    scored = score_candidates(candidates, smiles, db_reactions, max_results=req.max_candidates)
+    # 6. Score and select top-N via MILP
+    scored = score_candidates(
+        candidates, smiles, db_reactions, max_results=req.max_candidates,
+    )
 
     return SynthesizeResponse(
         smiles=mol_analysis.smiles,
-        properties=analysis_to_props(mol_analysis),
-        precursor_pairs=[scored_to_pair(sc) for sc in scored],
+        properties=_analysis_to_props(mol_analysis),
+        precursor_pairs=[_scored_to_pair(sc) for sc in scored],
     )
 
 
 @app.post("/multistep", response_model=MultistepResponse)
 async def multistep(req: MultistepRequest) -> MultistepResponse:
-    """
-    Multi-step synthesis: returns full synthesis DAG with CPM, PERT, and MILP analysis.
-    """
+    """Full multi-step synthesis DAG with CPM, PERT, and MILP analysis."""
+
     try:
         smiles = await resolve_smiles(req.iupac_name)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
-    # Collect retrosynthetic candidates for each step
-    candidates_per_step = []
-    current_smiles_list = [smiles]
+    # Build per-molecule retrosynthetic tree
+    retro_tree = build_retro_tree(
+        smiles,
+        max_depth=req.max_steps,
+        max_candidates_per_molecule=req.max_candidates_per_step,
+    )
 
-    for step in range(req.max_steps):
-        step_candidates = []
-        for smi in current_smiles_list:
-            cands = get_retro_candidates(smi, max_candidates=req.max_candidates_per_step)
-            step_candidates.extend(cands)
-        candidates_per_step.append(step_candidates)
-        # Next layer: all precursors from this step
-        next_smiles = []
-        for c in step_candidates:
-            next_smiles.extend(c.reactant_smiles)
-        current_smiles_list = list(set(next_smiles))
-        if not current_smiles_list:
-            break
+    # Build DAG from the retro tree
+    G = build_synthesis_dag(smiles, retro_tree)
 
-    # Build DAG
-    G = build_synthesis_dag(smiles, candidates_per_step)
-
-    # Topological order
-    from graph.dag import topological_order
+    # Topological order (starting materials first)
     topo = topological_order(G)
 
-    # CPM
+    # CPM — identify critical path
     cpm_edges, critical_path = run_cpm(G)
 
-    # PERT
+    # PERT — probabilistic yield estimates per edge
     pert_result = run_pert(G)
 
-    # MILP pathway selection
+    # Annotate DAG edges with PERT mu values using explicit key matching
+    # (avoids relying on iteration-order alignment between edges and steps)
+    edge_list = list(G.edges(data=True))
+    for idx, (src, dst, attrs) in enumerate(edge_list):
+        if idx < len(pert_result.steps):
+            attrs["mu"] = pert_result.steps[idx].mu
+
+    # MILP pathway selection (uses mu values from PERT)
     milp_result = select_optimal_pathway(G, smiles)
 
-    # Serialize DAG for React Flow
+    # Serialize DAG for React Flow (frontend)
     dag_dict = dag_to_dict(G)
 
-    # Annotate critical edges in DAG dict
+    # Annotate serialized edges with CPM/MILP metadata
     critical_edge_set = {(e.src, e.dst) for e in cpm_edges if e.is_critical}
+    optimal_edge_set = set(milp_result.selected_edges)
     for edge in dag_dict["edges"]:
-        edge["data"]["isCritical"] = (edge["source"], edge["target"]) in critical_edge_set
+        key = (edge["source"], edge["target"])
+        edge["data"]["isCritical"] = key in critical_edge_set
+        edge["data"]["isOptimal"] = key in optimal_edge_set
 
     return MultistepResponse(
         smiles=smiles,
@@ -300,15 +328,11 @@ async def multistep(req: MultistepRequest) -> MultistepResponse:
 
 @app.get("/molecule/{smiles:path}")
 async def get_molecule(smiles: str) -> dict:
-    """Return molecular properties and SVG for a given SMILES string."""
-    cached = get_cached_molecule(smiles)
-    if cached and cached.get("svg"):
-        return cached
-
+    """Return molecular properties and SVG for a SMILES string."""
     try:
         mol_analysis = analyze(smiles)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
     cache_molecule(
         smiles=mol_analysis.smiles,
@@ -317,9 +341,10 @@ async def get_molecule(smiles: str) -> dict:
         tpsa=mol_analysis.tpsa,
         svg=mol_analysis.svg,
     )
-    return analysis_to_props(mol_analysis).model_dump()
+    return _analysis_to_props(mol_analysis).model_dump()
 
 
 @app.get("/health")
 def health() -> dict:
+    """Liveness check."""
     return {"status": "ok"}
