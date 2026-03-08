@@ -2,9 +2,9 @@ fastapi==0.115.0
 uvicorn[standard]==0.30.6
 httpx==0.27.2
 rdkit-pypi==2022.9.5
-aizynthfinder==4.2.1
+aizynthfinder>=4.3.0
 pulp==2.9.0
-networkx==3.3
+networkx<3.0,>=2.4
 numpy==1.26.4
 scipy==1.13.1
 pydantic==2.8.2
