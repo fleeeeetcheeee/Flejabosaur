@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import warnings
 from functools import lru_cache
 
 from rdkit import Chem  # type: ignore[import-not-found]
@@ -55,16 +56,32 @@ def _canonicalize(smiles: str) -> str:
 
 
 def _load_model(task: str) -> tuple:
-    """Lazy-load model and tokenizer for a given task. Returns (model, tokenizer)."""
+    """Lazy-load model and tokenizer for a given task. Returns (model, tokenizer).
+
+    The yield model (sagawa/ReactionT5v2-yield) uses a custom regression
+    architecture with fc1-fc5 layers — NOT a standard seq2seq model.
+    Loading it with AutoModelForSeq2SeqLM produces corrupted-checkpoint
+    warnings and garbage predictions.  We skip it and let callers fall
+    back to k-NN yield averaging.
+    """
     if task in _models:
         return _models[task], _tokenizers[task]
+
+    # The yield checkpoint is a custom regression model, not seq2seq
+    if task == "yield":
+        logger.info("ReactionT5v2-yield uses a custom architecture; skipping local load (k-NN fallback).")
+        _models[task] = None
+        _tokenizers[task] = None
+        return None, None
 
     model_id = MODEL_IDS[task]
     try:
         from transformers import AutoTokenizer, AutoModelForSeq2SeqLM  # type: ignore[import-not-found]
         logger.info("Loading ReactionT5v2-%s from HuggingFace...", task)
         tokenizer = AutoTokenizer.from_pretrained(model_id)
-        model = AutoModelForSeq2SeqLM.from_pretrained(model_id)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            model = AutoModelForSeq2SeqLM.from_pretrained(model_id)
         model.eval()
         _models[task] = model
         _tokenizers[task] = tokenizer
@@ -233,7 +250,8 @@ def _seq2seq_generate(model, tokenizer, input_text: str, num_beams: int, num_ret
         )
         with torch.no_grad():
             outputs = model.generate(
-                **inputs,
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
                 num_beams=num_beams,
                 num_return_sequences=num_return,
                 max_new_tokens=256,
