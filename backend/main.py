@@ -5,6 +5,16 @@ FastAPI backend
 from __future__ import annotations
 
 import logging
+import sys
+from pathlib import Path
+
+# Ensure the backend/ directory is on sys.path so that bare imports like
+# `from chem.iupac import ...` resolve correctly when the server is started
+# from any working directory (e.g. `uvicorn backend.main:app` from project root).
+_BACKEND_DIR = Path(__file__).parent
+if str(_BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(_BACKEND_DIR))
+
 from typing import Any
 
 from fastapi import FastAPI, HTTPException

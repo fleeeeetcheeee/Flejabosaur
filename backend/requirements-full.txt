@@ -1,0 +1,14 @@
+# Full/optional heavy dependencies for local development with ML models
+# Install with: pip install -r requirements.txt -r requirements-full.txt
+#
+# These are NOT required to run the server — the app falls back to
+# SMARTS template matching when torch/transformers are absent,
+# and skips AiZynthFinder integration when aizynthfinder is absent.
+
+# Deep learning for ReactionT5v2 (HuggingFace seq2seq retrosynthesis + yield)
+torch>=2.1.0
+transformers>=4.40.0
+
+# AiZynthFinder MCTS (optional — complex install, conda recommended)
+# pip install aizynthfinder==4.2.1
+# aizynthfinder==4.2.1
