@@ -63,7 +63,7 @@ pytest
 
 ## Deployment (Railway)
 
-Use `rdkit-pypi` (pip-installable wheel — no conda needed).  Set the start
+Use `rdkit-pypi` (pip-installable wheel — no conda needed). Set the start
 command to:
 
 ```

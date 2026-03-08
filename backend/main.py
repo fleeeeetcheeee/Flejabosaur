@@ -10,7 +10,8 @@ from pathlib import Path
 
 # Ensure the backend/ directory is on sys.path so that bare imports like
 # `from chem.iupac import ...` resolve correctly when the server is started
-# from any working directory (e.g. `uvicorn backend.main:app` from project root).
+# from any working directory (e.g. `cd backend && uvicorn main:app --reload`
+# or `uvicorn backend.main:app` from the project root).
 _BACKEND_DIR = Path(__file__).parent
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
