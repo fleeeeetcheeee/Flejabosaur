@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import networkx as nx
 
-from ..chem.retrosynthesis import RetroCandidate
+from chem.retrosynthesis import RetroCandidate
 
 
 def build_synthesis_dag(
