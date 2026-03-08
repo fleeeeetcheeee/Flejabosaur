@@ -45,7 +45,7 @@ async def _pubchem_lookup(name: str) -> str | None:
             data = resp.json()
             props = data.get("PropertyTable", {}).get("Properties", [])
             if props:
-                return props[0].get("IsomericSMILES")
+                return props[0].get("IsomericSMILES") or props[0].get("SMILES")
         else:
             logger.warning("PubChem returned status %d for %r", resp.status_code, name)
     except Exception as exc:

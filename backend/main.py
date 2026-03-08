@@ -36,6 +36,7 @@ from chem.scoring import ScoredCandidate, score_candidates
 from db.query import (
     cache_molecule,
     ensure_db,
+    get_cached_molecule,
     get_cached_smiles,
     tanimoto_knn,
 )
@@ -329,6 +330,10 @@ async def multistep(req: MultistepRequest) -> MultistepResponse:
 @app.get("/molecule/{smiles:path}")
 async def get_molecule(smiles: str) -> dict:
     """Return molecular properties and SVG for a SMILES string."""
+    cached = get_cached_molecule(smiles)
+    if cached and cached.get("svg"):
+        return cached
+
     try:
         mol_analysis = analyze(smiles)
     except ValueError as exc:
