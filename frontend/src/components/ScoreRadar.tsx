@@ -15,13 +15,19 @@ interface Props {
   breakdown: ScoreBreakdown;
 }
 
+interface RadarDataPoint {
+  axis: string;
+  value: number;
+  raw: number;
+}
+
 export default function ScoreRadar({ breakdown }: Props) {
-  const data = [
-    { axis: "Tanimoto", value: breakdown.tanimoto },
-    { axis: "Mechanism", value: breakdown.mechanism },
-    { axis: "Yield", value: breakdown.yield_score },
-    { axis: "Hazard", value: breakdown.hazard },
-    { axis: "Forward", value: breakdown.forward },
+  const data: RadarDataPoint[] = [
+    { axis: "Tanimoto", value: breakdown.tanimoto, raw: breakdown.tanimoto },
+    { axis: "Mechanism", value: breakdown.mechanism, raw: breakdown.mechanism },
+    { axis: "Yield", value: breakdown.yield_score, raw: breakdown.yield_score },
+    { axis: "Safety", value: 1 - breakdown.hazard, raw: breakdown.hazard },
+    { axis: "Forward", value: breakdown.forward, raw: breakdown.forward },
   ];
 
   return (
@@ -43,7 +49,11 @@ export default function ScoreRadar({ breakdown }: Props) {
             borderRadius: 8,
             fontSize: 12,
           }}
-          formatter={(v) => typeof v === "number" ? v.toFixed(3) : String(v)}
+          formatter={(v, _name, entry) => {
+            const point = entry?.payload as RadarDataPoint | undefined;
+            const display = point?.raw !== undefined ? point.raw : v;
+            return typeof display === "number" ? display.toFixed(3) : String(display);
+          }}
         />
       </RadarChart>
     </ResponsiveContainer>

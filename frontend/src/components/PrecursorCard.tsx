@@ -20,6 +20,12 @@ function conditionBadge(key: string, value: string | number) {
   );
 }
 
+function sourceLabel(source: string): string {
+  if (source === "template") return "SMARTS Template";
+  if (source === "reactiont5") return "ML Predicted";
+  return source;
+}
+
 export default function PrecursorCard({ pair, rank }: Props) {
   const pct = (pair.probability * 100).toFixed(1);
 
@@ -30,9 +36,13 @@ export default function PrecursorCard({ pair, rank }: Props) {
         <div className="flex items-center gap-2">
           <span className="text-sm font-bold text-accent-light">#{rank}</span>
           <span className="font-semibold">{pair.reaction_name.replace(/_/g, " ")}</span>
-          <span className="text-xs text-muted">({pair.source})</span>
+          <span className="text-[10px] bg-accent/20 text-accent-light rounded-full px-2 py-0.5">
+            {sourceLabel(pair.source)}
+          </span>
         </div>
-        <span className="text-lg font-bold text-green">{pct}%</span>
+        <span className={`text-lg font-bold ${
+          pair.probability >= 0.7 ? "text-green" : pair.probability >= 0.4 ? "text-yellow" : "text-red"
+        }`}>{pct}%</span>
       </div>
 
       {/* Conditions */}

@@ -14,7 +14,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Flejabosaur — Retrosynthesis Explorer",
+  title: "ChemSynthe — Retrosynthesis Explorer",
   description:
     "Find the most probable precursor molecules for any target compound using graph theory and ML-powered retrosynthesis.",
 };
@@ -32,7 +32,7 @@ export default function RootLayout({
         <header className="border-b border-card-border bg-card/60 backdrop-blur sticky top-0 z-50">
           <div className="max-w-6xl mx-auto px-4 py-3 flex items-center gap-3">
             <Link href="/" className="text-lg font-bold tracking-tight text-accent-light">
-              Flejabosaur
+              ChemSynthe
             </Link>
             <span className="text-xs text-muted">Retrosynthesis Explorer</span>
           </div>
