@@ -168,7 +168,57 @@ def get_retro_candidates(target_smiles: str, max_candidates: int = 5) -> "list[R
 
     while len(merged) > max_candidates:
         merged.pop()
+
+    # Final classification pass: classify any remaining candidates still showing "unknown"
+    for cand in merged:
+        if cand.reaction_name == "unknown":
+            rxn_name, rxn_conditions = _classify_reaction(cand.reactant_smiles, target_smiles)
+            cand.reaction_name = rxn_name
+            if rxn_conditions and not cand.conditions:
+                cand.conditions = rxn_conditions
+
     return merged
+
+
+def _classify_reaction(reactant_smiles: list[str], target_smiles: str) -> tuple[str, dict]:
+    """
+    Classify a reaction by matching product and reactant SMILES against
+    known RETRO_TEMPLATES. Returns (reaction_name, conditions).
+    """
+    target_mol = Chem.MolFromSmiles(target_smiles)
+    if target_mol is None:
+        return ("unknown", {})
+
+    reactant_mols = []
+    for smi in reactant_smiles:
+        m = Chem.MolFromSmiles(smi)
+        if m is not None:
+            reactant_mols.append(m)
+
+    for name, product_smarts, precursor_smarts_list, conditions in RETRO_TEMPLATES:
+        product_pattern = Chem.MolFromSmarts(product_smarts)
+        if product_pattern is None:
+            continue
+        if not target_mol.HasSubstructMatch(product_pattern):
+            continue
+
+        # Check if any reactant matches any precursor pattern
+        matched_any_precursor = False
+        for ps in precursor_smarts_list:
+            precursor_pattern = Chem.MolFromSmarts(ps)
+            if precursor_pattern is None:
+                continue
+            for rmol in reactant_mols:
+                if rmol.HasSubstructMatch(precursor_pattern):
+                    matched_any_precursor = True
+                    break
+            if matched_any_precursor:
+                break
+
+        if matched_any_precursor:
+            return (name, dict(conditions))
+
+    return ("unknown", {})
 
 
 def _aizynthfinder_retro(smiles: str, max_candidates: int) -> "list[RetroCandidate]":
@@ -226,11 +276,12 @@ def _reactiont5_retro(smiles: str, max_candidates: int) -> "list[RetroCandidate]
             reactants = [r.strip() for r in beam_smiles.split(".") if r.strip()]
             if not reactants:
                 continue
+            rxn_name, rxn_conditions = _classify_reaction(reactants, smiles)
             candidates.append(RetroCandidate(
                 reactant_smiles=reactants,
-                reaction_name="unknown",        # T5 does not return reaction names
+                reaction_name=rxn_name,
                 template_smarts="",
-                conditions={},
+                conditions=rxn_conditions,
                 source="reactiont5",
             ))
         return candidates
