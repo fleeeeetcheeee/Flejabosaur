@@ -1,5 +1,5 @@
 # ChemSynthe
 Group Git Repository for HackTJ 13.0 
 
-A tool designed to assist chemists in investigating reaction mechanisms using retrosynthesis, known datasets, and artificial intelligence models. With the potential to greatly reduce time spent testing unfeasible reaction mechanisms, chemists have the ability to synthesize new compounds more efficiently.
+A tool designed to assist chemists in investigating reaction mechanisms using retrosynthesis, known datasets, and artificial intelligence models. With the potential to greatly reduce time spent testing unfeasible reaction mechanisms, chemists will have the ability to synthesize new compounds more efficiently.
 
